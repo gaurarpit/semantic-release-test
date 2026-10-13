@@ -1,0 +1,19 @@
+{
+  "plugins": {
+    "commit-analyzer": {
+      "name": "default"
+    },
+    "ci-condition": {
+      "name": "github"
+    },
+    "changelog-generator": {
+      "name": "default"
+    },
+    "provider": {
+      "name": "chart-github@0.1.0"
+    },
+    "files-updater": {
+      "names": ["helm@1.4.0"]
+    }
+  }
+}

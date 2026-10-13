@@ -1,0 +1,124 @@
+name: Release Helm charts
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "charts/**"
+      - "cmd/**"
+      - "internal/**"
+      - ".semrelrc"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/release-charts.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: azure/setup-helm@v4.2.0
+        with:
+          version: v3.16.4
+
+      - name: Test chart provider
+        run: go test ./...
+
+      - name: Lint Helm charts
+        run: |
+          for chart in charts/*; do
+            helm lint "$chart"
+          done
+
+  release:
+    needs: validate
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        chart:
+          - api
+          - worker
+          - web
+          - scheduler
+    concurrency:
+      group: chart-release-${{ matrix.chart }}
+      cancel-in-progress: false
+    env:
+      CHART_NAME: ${{ matrix.chart }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: azure/setup-helm@v4.2.0
+        with:
+          version: v3.16.4
+
+      - name: Install go-semantic-release and chart provider
+        run: |
+          go install github.com/go-semantic-release/semantic-release/v2/cmd/semantic-release@v2.31.0
+          mkdir -p .semrel/linux_amd64/provider-chart-github/0.1.0
+          go build -o .semrel/linux_amd64/provider-chart-github/0.1.0/chart-github ./cmd/chart-provider
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Verify Docker Hub credentials
+        env:
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [[ -z "$DOCKERHUB_TOKEN" ]]; then
+            echo "::error::Add the DOCKERHUB_TOKEN repository secret before releasing charts."
+            exit 1
+          fi
+
+      - name: Calculate version and create GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: >-
+          semantic-release
+          --provider-opt "chart_name=${CHART_NAME}"
+          --update "charts/${CHART_NAME}/Chart.yaml"
+          --allow-no-changes
+
+      - name: Check whether this chart was released
+        id: release-check
+        run: |
+          git fetch --tags
+          tag_prefix="charts/${CHART_NAME}/v"
+          release_tag="$(git tag --points-at "$GITHUB_SHA" --list "${tag_prefix}*" | sort -V | tail -n 1)"
+          if [[ -z "$release_tag" ]]; then
+            echo "released=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "released=true" >> "$GITHUB_OUTPUT"
+            echo "version=${release_tag#"$tag_prefix"}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log in to Docker Hub
+        if: steps.release-check.outputs.released == 'true'
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: echo "$DOCKERHUB_TOKEN" | helm registry login registry-1.docker.io -u "$DOCKERHUB_USERNAME" --password-stdin
+
+      - name: Package and publish chart
+        if: steps.release-check.outputs.released == 'true'
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          CHART_VERSION: ${{ steps.release-check.outputs.version }}
+        run: |
+          mkdir -p dist
+          helm package "charts/${CHART_NAME}" --version "$CHART_VERSION" --destination dist
+          helm push "dist/${CHART_NAME}-${CHART_VERSION}.tgz" "oci://registry-1.docker.io/${DOCKERHUB_USERNAME}"
